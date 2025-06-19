@@ -1,5 +1,5 @@
-import logging
-from telegram import Update, ChatMember, Message
+import asyncio
+from telegram import Update, User
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -8,185 +8,160 @@ from telegram.ext import (
     filters,
 )
 from core.analyze import analyze_conflict
-from datetime import datetime, timedelta
-import asyncio
 
-# 🔧 Настройки
 TOKEN = "ТВОЙ_ТОКЕН"
 OWNER_ID = 1609956648
 MODERATORS = [1609956648]
 
-# 💬 Состояния
-active_dispute = False
-dispute_users = set()
-dispute_log = []
-last_activity = None
-AUTO_CLOSE_SECONDS = 300
+# Активные споры: (user1_id, user2_id) -> [messages...]
+active_disputes = {}
+last_active = {}
 
-# ⚙️ Логгер
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-# 👥 Команды
+# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я — бот-судья. Используй /spor @user, чтобы начать спор.")
+    await update.message.reply_text("Я — бот-судья. Используй /spor @пользователь, чтобы начать спор.")
 
+# /myid
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой ID: {update.effective_user.id}")
 
+# /youid
 async def youid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
-        target_id = update.message.reply_to_message.from_user.id
-        await update.message.reply_text(f"ID этого пользователя: {target_id}")
+        uid = update.message.reply_to_message.from_user.id
+        await update.message.reply_text(f"ID пользователя: {uid}")
     else:
-        await update.message.reply_text("Ответь на сообщение пользователя, чтобы узнать его ID.")
+        await update.message.reply_text("Ответь на сообщение человека.")
 
+# /spor
 async def spor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_dispute, dispute_users, dispute_log, last_activity
-
-    if active_dispute:
-        await update.message.reply_text("Спор уже активен.")
-        return
-
     if not update.message.reply_to_message:
-        await update.message.reply_text("Ответь на сообщение пользователя, с кем хочешь начать спор.")
+        await update.message.reply_text("Ответь на сообщение того, с кем хочешь начать спор.")
         return
 
     user1 = update.effective_user.id
     user2 = update.message.reply_to_message.from_user.id
 
     if user1 in MODERATORS and user2 in MODERATORS:
-        await update.message.reply_text("⚠️ Споры между модераторами не рассматриваются.")
+        await update.message.reply_text("⚠️ Спор между модераторами невозможен.")
         return
 
-    dispute_users = {user1, user2}
-    active_dispute = True
-    dispute_log = []
-    last_activity = datetime.utcnow()
-
-    await update.message.reply_text("⚖️ Спор начат. Отправляйте сообщения.")
-    asyncio.create_task(check_dispute_timeout(context))
-
-async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_dispute, dispute_users, dispute_log
-    if update.effective_user.id not in dispute_users:
-        await update.message.reply_text("Ты не участвуешь в споре.")
+    key = tuple(sorted((user1, user2)))
+    if key in active_disputes:
+        await update.message.reply_text("Спор уже идёт.")
         return
 
-    await update.message.reply_text("Спор завершён.")
-    dispute_users = set()
-    dispute_log = []
-    active_dispute = False
+    active_disputes[key] = []
+    last_active[key] = asyncio.get_event_loop().time()
+    await update.message.reply_text("✅ Спор начат. Пишите аргументы!")
 
-async def mend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in MODERATORS:
-        await update.message.reply_text("Только модератор может завершить спор.")
-        return
-
-    global active_dispute, dispute_users, dispute_log
-    active_dispute = False
-    dispute_users = set()
-    dispute_log = []
-    await update.message.reply_text("🛑 Спор модератором завершён.")
-
+# /log
 async def log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in dispute_users:
-        await update.message.reply_text("Ты не участвуешь в споре.")
-        return
+    user1 = update.effective_user.id
+    for (u1, u2), messages in active_disputes.items():
+        if user1 in (u1, u2):
+            log_text = "\n".join(messages[-10:])
+            await update.message.reply_text(f"📝 Последние сообщения:\n{log_text}")
+            return
+    await update.message.reply_text("Нет активного спора.")
 
-    if not dispute_log:
-        await update.message.reply_text("Лог пуст.")
-        return
-
-    await update.message.reply_text("📜 Лог:\n" + "\n".join(dispute_log[-10:]))
-
+# /mlog
 async def mlog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in MODERATORS:
-        await update.message.reply_text("Нет доступа.")
-        return
+        return await update.message.reply_text("Нет доступа.")
 
+    uid = None
     if update.message.reply_to_message:
         uid = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
             uid = int(context.args[0])
-        except:
-            await update.message.reply_text("Неверный ID.")
+        except ValueError:
+            return await update.message.reply_text("Неверный ID.")
+
+    if uid:
+        for (u1, u2), messages in active_disputes.items():
+            if uid in (u1, u2):
+                log_text = "\n".join(messages[-10:])
+                return await update.message.reply_text(f"📝 Лог спора:\n{log_text}")
+        return await update.message.reply_text("Спор не найден.")
+    await update.message.reply_text("Укажи ID или ответь на сообщение.")
+
+# /end
+async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    for key in list(active_disputes.keys()):
+        if uid in key:
+            verdict = analyze_conflict("\n".join(active_disputes[key]))
+            del active_disputes[key]
+            del last_active[key]
+            await update.message.reply_text(f"✅ Спор завершён.\n📜 Вердикт: {verdict}")
             return
-    else:
-        await update.message.reply_text("Укажи ID или ответь на сообщение.")
-        return
+    await update.message.reply_text("Нет активного спора.")
 
-    lines = [line for line in dispute_log if str(uid) in line]
-    if not lines:
-        await update.message.reply_text("Ничего не найдено.")
-    else:
-        await update.message.reply_text("📄 MLog:\n" + "\n".join(lines[-10:]))
-
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# /mend
+async def mend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in MODERATORS:
-        await update.message.reply_text("Ты не модератор.")
-        return
+        return await update.message.reply_text("Нет доступа.")
 
     if update.message.reply_to_message:
-        target = update.message.reply_to_message.from_user.id
+        uid = update.message.reply_to_message.from_user.id
+        for key in list(active_disputes.keys()):
+            if uid in key:
+                del active_disputes[key]
+                del last_active[key]
+                return await update.message.reply_text("Спор принудительно завершён.")
+    await update.message.reply_text("Укажи спор через ответ на сообщение.")
+
+# /kick
+async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in MODERATORS:
+        return await update.message.reply_text("Нет доступа.")
+    if update.message.reply_to_message:
         try:
-            await context.bot.ban_chat_member(update.effective_chat.id, target)
-            await update.message.reply_text("✅ Успешно кикнут.")
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка: {e}")
+            await update.message.chat.ban_member(update.message.reply_to_message.from_user.id)
+            await update.message.reply_text("🚫 Пользователь исключён.")
+        except:
+            await update.message.reply_text("❌ Не удалось исключить.")
     else:
         await update.message.reply_text("Ответь на сообщение пользователя.")
 
-# 📩 Обработка сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_activity
-
-    if not active_dispute or update.effective_user.id not in dispute_users:
-        return
-
-    last_activity = datetime.utcnow()
-
-    msg = f"[{update.effective_user.id}] {update.message.text}"
-    dispute_log.append(msg)
-
-    if any(str(uid) in update.message.text for uid in map(str, MODERATORS)):
-        await update.message.reply_text("⚠️ Споры с модераторами не рассматриваются.")
-        return
-
-    verdict = analyze_conflict(update.message.text)
-    await update.message.reply_text(f"📜 Вердикт:\n{verdict}")
-
-# ⏳ Автозакрытие
-async def check_dispute_timeout(context: ContextTypes.DEFAULT_TYPE):
-    global last_activity, active_dispute
-    while active_dispute:
-        if datetime.utcnow() - last_activity > timedelta(seconds=AUTO_CLOSE_SECONDS):
-            active_dispute = False
-            await context.bot.send_message(chat_id=context.application.bot_data["chat_id"], text="⏱ Спор завершён по неактивности.")
+# Принимаем все сообщения и логируем их
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    for key in active_disputes:
+        if uid in key:
+            active_disputes[key].append(f"{uid}: {update.message.text}")
+            last_active[key] = asyncio.get_event_loop().time()
             break
-        await asyncio.sleep(30)
 
-# 🚀 MAIN
+# Проверка на неактивность
+async def check_inactivity(app):
+    while True:
+        now = asyncio.get_event_loop().time()
+        for key in list(last_active):
+            if now - last_active[key] > 300:  # 5 минут
+                del active_disputes[key]
+                del last_active[key]
+        await asyncio.sleep(60)
+
+# Запуск
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
-    app.bot_data["chat_id"] = OWNER_ID  # для автозавершения
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("youid", youid))
     app.add_handler(CommandHandler("spor", spor))
-    app.add_handler(CommandHandler("end", end))
-    app.add_handler(CommandHandler("mend", mend))
     app.add_handler(CommandHandler("log", log))
     app.add_handler(CommandHandler("mlog", mlog))
+    app.add_handler(CommandHandler("end", end))
+    app.add_handler(CommandHandler("mend", mend))
     app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
+    app.create_task(check_inactivity(app))
     await app.run_polling()
 
-if __name__ == '__main__':
-    import asyncio
+if __name__ == "__main__":
     asyncio.run(main())
